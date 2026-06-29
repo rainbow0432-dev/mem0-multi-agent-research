@@ -786,14 +786,100 @@ This is a managed integration — mem0 is built into the Strands SDK with AWS-na
 
 | Plugin | Mode | Tools | Notes |
 |---|---|---|---|
-| `beersoccer/mem0ai` (v0.3.1) | Self-hosted (runs mem0 inside plugin container) | 12 (add, search, get, update, delete, extract_long_term, forget, etc.) | Async mode, access-log-driven forgetting, most feature-rich |
+| `beersoccer/mem0ai` (v0.3.1) | Self-hosted (Python library inside plugin container) | 12 (add, search, get, update, delete, extract_long_term, forget, etc.) | Async mode, access-log-driven forgetting, most feature-rich |
 | `Feversun/dify-plugin-mem0` | Cloud (mem0 Platform API v2) | 8 | Simpler, uses managed mem0 |
 | `yevanchen/mem0` | Cloud | Basic add/retrieve | Referenced by mem0's own docs page |
 | `sysam68/mem0_dify_plugin` | Self-hosted (fork of beersoccer) | Same as beersoccer | Fork |
 
-**Note**: The `beersoccer/mem0ai` plugin runs mem0 as a library INSIDE the Dify plugin container — it does NOT connect to an external mem0 REST server. It IS the mem0 instance. If you want a central REST server shared by multiple services, use the Custom Tool or HTTP Request path instead.
+### 9.4 Which mem0 deployment mode does the beersoccer plugin use?
 
-### 9.4 mem0's `marketplace.json` is NOT a Dify plugin
+**The `beersoccer/mem0ai` plugin uses the Python library mode** — specifically `AsyncMemory.from_config()` from the `mem0ai` Python package. It does NOT use the REST server, MCP server, or any HTTP API to connect to an external mem0 instance. The plugin IS the mem0 instance — it runs mem0 as an embedded library inside the Dify plugin daemon process.
+
+#### Evidence
+
+**1. Marketplace page** (https://marketplace.dify.ai/plugin/beersoccer/mem0ai):
+
+> "Self-Hosted Mode - Run with Local Mem0 (JSON-based config)"
+> "Simplified Local Config - 5 JSON blocks: LLM, Embedder, Vector DB, Graph DB (optional), Reranker (optional)"
+
+The 5 JSON config blocks are the **mem0 library's config** (`MemoryConfig`), not REST API connection settings. There is no `mem0_rest_url` or `mem0_api_url` credential field.
+
+**2. Changelog evidence**:
+
+| Version | Change | What it tells us |
+|---|---|---|
+| v0.0.4 | "Dual-mode (SaaS/Local), unified client, simplified Local JSON config, **HTTP→SDK refactor**" | Plugin was refactored from making HTTP calls to using the SDK (Python library) directly |
+| v0.0.7 | "**Self-hosted mode refactor**, centralized constants, background event loop" | Confirmed: self-hosted = library mode, not REST |
+| v0.0.8 | "async_mode credential (default true), **sync/async tool routing**" | Uses async memory operations |
+| v0.2.11 | "**AsyncMemory.from_config** compatibility across mem0 variants" | Directly names the class: `AsyncMemory.from_config()` |
+
+**3. The two-class pattern** (confirmed from multiple repos using mem0):
+
+```python
+# Self-hosted (Python library) — what the plugin uses
+from mem0 import AsyncMemory
+memory = AsyncMemory.from_config(config)  # runs mem0 in-process
+
+# Platform/Cloud (HTTP client) — NOT what the plugin uses
+from mem0 import AsyncMemoryClient
+client = AsyncMemoryClient(api_key="m0-...")  # calls api.mem0.ai over HTTP
+```
+
+From the Upsonic repo's docstring (clear summary):
+> "Self-hosted Mem0 (via AsyncMemory class from mem0 library) / Mem0 Platform (via AsyncMemoryClient class from mem0 library)"
+
+From the agentscope repo:
+> "Works with either `mem0.AsyncMemory` (open-source) or `mem0.AsyncMemoryClient` (hosted Platform)"
+
+From the microsoft/agent-framework repo:
+> `mem0_client: AsyncMemory | AsyncMemoryClient | None = None`
+> `from mem0 import AsyncMemory, AsyncMemoryClient`
+
+**4. No REST URL config exists**: The plugin's credentials are 5 JSON blocks (`llm_config`, `embedder_config`, `vector_store_config`, `graph_store_config`, `reranker_config`) plus `async_mode` and `log_level`. There is no field for a mem0 REST server URL. The plugin cannot connect to an external REST server even if you wanted it to.
+
+#### Architecture: plugin IS the mem0 instance
+
+```
+┌─────────────────────────────────────────────────────┐
+│  Dify (self-hosted, Docker)                          │
+│                                                      │
+│  ┌──────────────┐    ┌───────────────────────────┐  │
+│  │ LLM App      │    │  mem0 Plugin Daemon       │  │
+│  │ (Chatflow)   │───▶│                           │  │
+│  │              │    │  ┌─────────────────────┐  │  │
+│  │  Agent Node  │    │  │ AsyncMemory         │  │  │
+│  │  calls plugin│    │  │ .from_config()      │  │  │
+│  │  tools       │    │  │                     │  │  │
+│  │              │    │  │ = embedded Python   │  │  │
+│  │              │    │  │   library, NOT a    │  │  │
+│  │              │    │  │   REST client       │  │  │
+│  └──────────────┘    │  └─────────┬───────────┘  │  │
+│                      │            │              │  │
+│                      │            ├──▶ Postgres  │  │
+│                      │            │   (pgvector) │  │
+│                      │            │              │  │
+│                      │            ├──▶ OpenAI    │  │
+│                      │            │   (LLM+emb) │  │
+│                      │            │              │  │
+│                      │            └──▶ Neo4j    │  │
+│                      │                (optional)│  │
+│                      └───────────────────────────┘  │
+└─────────────────────────────────────────────────────┘
+
+  ❌ NO separate mem0 REST server (:8888)
+  ❌ NO MCP server
+  ✅ mem0 runs as a Python library inside the plugin daemon
+```
+
+#### Implication for deployment
+
+| If you... | Then... |
+|---|---|
+| Use the `beersoccer/mem0ai` plugin | You do NOT need a separate mem0 REST server. The plugin handles everything — just configure the 5 JSON blocks and the plugin connects directly to your Postgres/Qdrant, OpenAI/Ollama, etc. |
+| Want a separate central mem0 REST server (shared by Dify + other services) | The plugin is the WRONG integration path. Use **Dify Custom Tool (OpenAPI)** or **HTTP Request nodes** to call the REST server's endpoints instead. |
+| Want to use mem0 Cloud (api.mem0.ai) | Use the `Feversun/dify-plugin-mem0` plugin (Cloud API v2) or `yevanchen/mem0` plugin instead — these use `MemoryClient` (HTTP client to api.mem0.ai), not the embedded library. |
+
+### 9.5 mem0's `marketplace.json` is NOT a Dify plugin
 
 The mem0 repo root has a `marketplace.json` file, but it references `./integrations/mem0-plugin/` which is a **coding-agent plugin** (for Cursor, Codex, opencode) — NOT a Dify plugin. mem0 ships no official Dify plugin. The Dify ecosystem is entirely community-built.
 

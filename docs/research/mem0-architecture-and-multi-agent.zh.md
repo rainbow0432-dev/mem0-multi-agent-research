@@ -785,14 +785,100 @@ relevant_memories = memory_client.search(question, filters={"user_id": USER_ID})
 
 | 插件 | 模式 | 工具 | 备注 |
 |---|---|---|---|
-| `beersoccer/mem0ai` (v0.3.1) | 自托管（在插件容器内运行 mem0） | 12（add, search, get, update, delete, extract_long_term, forget 等） | 异步模式，基于访问日志的遗忘曲线，功能最丰富 |
+| `beersoccer/mem0ai` (v0.3.1) | 自托管（插件容器内的 Python 库） | 12（add, search, get, update, delete, extract_long_term, forget 等） | 异步模式，基于访问日志的遗忘曲线，功能最丰富 |
 | `Feversun/dify-plugin-mem0` | 云端（mem0 Platform API v2） | 8 | 更简单，使用托管 mem0 |
 | `yevanchen/mem0` | 云端 | 基本添加/检索 | 被 mem0 自己的文档页面引用 |
 | `sysam68/mem0_dify_plugin` | 自托管（beersoccer 的 fork） | 与 beersoccer 相同 | Fork |
 
-**注意**：`beersoccer/mem0ai` 插件在 Dify 插件容器**内部**以库的形式运行 mem0——它**不**连接到外部 mem0 REST 服务器。它本身就是 mem0 实例。如果你想要一个被多个服务共享的中央 REST 服务器，请使用 Custom Tool 或 HTTP Request 路径。
+### 9.4 beersoccer 插件使用哪种 mem0 部署模式？
 
-### 9.4 mem0 的 `marketplace.json` 不是 Dify 插件
+**`beersoccer/mem0ai` 插件使用 Python 库模式**——即 `mem0ai` Python 包中的 `AsyncMemory.from_config()`。它**不**使用 REST 服务器、MCP 服务器或任何 HTTP API 来连接外部 mem0 实例。插件本身就是 mem0 实例——它在 Dify 插件守护进程内以嵌入式库的形式运行 mem0。
+
+#### 证据
+
+**1. Marketplace 页面**（https://marketplace.dify.ai/plugin/beersoccer/mem0ai）：
+
+> "Self-Hosted Mode - Run with Local Mem0 (JSON-based config)"
+> "Simplified Local Config - 5 JSON blocks: LLM, Embedder, Vector DB, Graph DB (optional), Reranker (optional)"
+
+5 个 JSON 配置块是 **mem0 库的配置**（`MemoryConfig`），不是 REST API 连接设置。没有 `mem0_rest_url` 或 `mem0_api_url` 凭据字段。
+
+**2. 变更日志证据**：
+
+| 版本 | 变更 | 说明 |
+|---|---|---|
+| v0.0.4 | "Dual-mode (SaaS/Local), unified client, simplified Local JSON config, **HTTP→SDK refactor**" | 插件从 HTTP 调用重构为直接使用 SDK（Python 库） |
+| v0.0.7 | "**Self-hosted mode refactor**, centralized constants, background event loop" | 确认：自托管 = 库模式，非 REST |
+| v0.0.8 | "async_mode credential (default true), **sync/async tool routing**" | 使用异步记忆操作 |
+| v0.2.11 | "**AsyncMemory.from_config** compatibility across mem0 variants" | 直接点名了类：`AsyncMemory.from_config()` |
+
+**3. 双类模式**（从多个使用 mem0 的仓库确认）：
+
+```python
+# 自托管（Python 库）—— 插件使用的模式
+from mem0 import AsyncMemory
+memory = AsyncMemory.from_config(config)  # 在进程内运行 mem0
+
+# Platform/Cloud（HTTP 客户端）—— 插件不使用此模式
+from mem0 import AsyncMemoryClient
+client = AsyncMemoryClient(api_key="m0-...")  # 通过 HTTP 调用 api.mem0.ai
+```
+
+来自 Upsonic 仓库的文档字符串（清晰总结）：
+> "Self-hosted Mem0 (via AsyncMemory class from mem0 library) / Mem0 Platform (via AsyncMemoryClient class from mem0 library)"
+
+来自 agentscope 仓库：
+> "Works with either `mem0.AsyncMemory` (open-source) or `mem0.AsyncMemoryClient` (hosted Platform)"
+
+来自 microsoft/agent-framework 仓库：
+> `mem0_client: AsyncMemory | AsyncMemoryClient | None = None`
+> `from mem0 import AsyncMemory, AsyncMemoryClient`
+
+**4. 不存在 REST URL 配置**：插件的凭据是 5 个 JSON 块（`llm_config`、`embedder_config`、`vector_store_config`、`graph_store_config`、`reranker_config`）加 `async_mode` 和 `log_level`。没有 mem0 REST 服务器 URL 字段。即使你想连接外部 REST 服务器，插件也无法做到。
+
+#### 架构：插件本身就是 mem0 实例
+
+```
+┌─────────────────────────────────────────────────────┐
+│  Dify（自托管, Docker）                               │
+│                                                      │
+│  ┌──────────────┐    ┌───────────────────────────┐  │
+│  │ LLM 应用     │    │  mem0 插件守护进程        │  │
+│  │ (Chatflow)   │───▶│                           │  │
+│  │              │    │  ┌─────────────────────┐  │  │
+│  │  Agent 节点  │    │  │ AsyncMemory         │  │  │
+│  │  调用插件    │    │  │ .from_config()      │  │  │
+│  │  工具        │    │  │                     │  │  │
+│  │              │    │  │ = 嵌入式 Python     │  │  │
+│  │              │    │  │   库，不是          │  │  │
+│  │              │    │  │   REST 客户端       │  │  │
+│  └──────────────┘    │  └─────────┬───────────┘  │  │
+│                      │            │              │  │
+│                      │            ├──▶ Postgres  │  │
+│                      │            │   (pgvector) │  │
+│                      │            │              │  │
+│                      │            ├──▶ OpenAI    │  │
+│                      │            │   (LLM+emb) │  │
+│                      │            │              │  │
+│                      │            └──▶ Neo4j    │  │
+│                      │                (可选)     │  │
+│                      └───────────────────────────┘  │
+└─────────────────────────────────────────────────────┘
+
+  ❌ 没有独立的 mem0 REST 服务器 (:8888)
+  ❌ 没有 MCP 服务器
+  ✅ mem0 作为 Python 库在插件守护进程内运行
+```
+
+#### 对部署的影响
+
+| 如果你... | 那么... |
+|---|---|
+| 使用 `beersoccer/mem0ai` 插件 | 你**不需要**独立的 mem0 REST 服务器。插件处理一切——只需配置 5 个 JSON 块，插件直接连接你的 Postgres/Qdrant、OpenAI/Ollama 等。 |
+| 想要独立的中央 mem0 REST 服务器（被 Dify + 其他服务共享） | 插件是**错误**的集成路径。改用 **Dify Custom Tool (OpenAPI)** 或 **HTTP Request 节点**调用 REST 服务器的端点。 |
+| 想使用 mem0 Cloud (api.mem0.ai) | 改用 `Feversun/dify-plugin-mem0` 插件（Cloud API v2）或 `yevanchen/mem0` 插件——它们使用 `MemoryClient`（到 api.mem0.ai 的 HTTP 客户端），不是嵌入式库。 |
+
+### 9.5 mem0 的 `marketplace.json` 不是 Dify 插件
 
 mem0 仓库根目录有一个 `marketplace.json` 文件，但它引用的 `./integrations/mem0-plugin/` 是一个**编程 Agent 插件**（用于 Cursor、Codex、opencode）——**不是** Dify 插件。mem0 不提供官方 Dify 插件。Dify 生态系统完全由社区构建。
 
