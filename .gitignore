@@ -1,0 +1,8 @@
+.codegraph/
+.env
+mem0-repo/
+pgdata/
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
