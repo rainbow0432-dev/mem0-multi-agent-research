@@ -19,6 +19,201 @@ When you call `add(messages, user_id=...)`, mem0's LLM:
 
 This is not a simple append — mem0 intelligently manages memory state. If a user says "I now prefer Python over Java," mem0 updates the existing "prefers Java" memory rather than creating a contradictory duplicate.
 
+### Internal Component Architecture
+
+mem0 is a modular system with a central orchestrator (`Memory` class) and pluggable component providers. All components use the **Provider pattern** — configurable via JSON, swappable without code changes.
+
+#### Components
+
+| Component | Source directory | Role | Providers (examples) |
+|---|---|---|---|
+| **Memory** (orchestrator) | `mem0/memory/main.py` | Central hub — orchestrates the entire add/search/update/delete pipeline | N/A (single class) |
+| **LLM** | `mem0/llms/` | Extracts facts from conversations; makes A.U.D.N. decisions (Add/Update/Delete/Noop) | OpenAI, Anthropic, Ollama, Azure, Gemini, Groq, DeepSeek, vLLM, LM Studio (18+) |
+| **Embedder** | `mem0/embeddings/` | Converts text to vector embeddings for semantic search | OpenAI, HuggingFace, Ollama, Azure, Gemini, FastEmbed, Together (13+) |
+| **Vector Store** | `mem0/vector_stores/` | Stores and retrieves vector embeddings with metadata filters | Qdrant, pgvector, Milvus, Weaviate, Redis, Chroma, Pinecone, OpenSearch, MongoDB (23+) |
+| **Graph Store** (optional) | `mem0/graphs/` | Models entity relationships as a knowledge graph (Mem0g variant) | Neo4j, Memgraph |
+| **Reranker** (optional) | `mem0/reranker/` | Re-ranks search results for better relevance | Cohere, HuggingFace, SentenceTransformer, LLM, ZeroEntropy |
+| **History DB** | `mem0/memory/storage.py` | SQLite — tracks every add/update/delete for audit | SQLite (built-in) |
+| **Config** | `mem0/configs/base.py` | Defines the config schema for all components | N/A |
+| **Utils** | `mem0/utils/factory.py` | Factory pattern — instantiates the right provider from config | N/A |
+| **Client** | `mem0/client/main.py` | Platform API client (for mem0 Cloud) | N/A |
+| **Proxy** | `mem0/proxy/main.py` | OpenAI-compatible proxy that auto-handles memory | N/A |
+
+#### Architecture Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         mem0 Internal Architecture                      │
+│                                                                         │
+│                    ┌─────────────────┐                                  │
+│                    │  Memory Class   │  ← Central orchestrator          │
+│                    │  (main.py)      │    Entry point: add(), search()  │
+│                    └───────┬─────────┘                                  │
+│                            │                                           │
+│              ┌─────────────┼─────────────┐                              │
+│              │             │             │                              │
+│              ▼             ▼             ▼                              │
+│     ┌────────────┐ ┌────────────┐ ┌────────────┐                       │
+│     │   Config   │ │   Utils    │ │ History DB │                       │
+│     │ (base.py)  │ │ (factory)  │ │ (SQLite)   │                       │
+│     │            │ │            │ │ audit trail│                       │
+│     └────────────┘ └────────────┘ └────────────┘                       │
+│                            │                                           │
+│    ┌───────────────────────┼───────────────────────┐                   │
+│    │                       │                       │                   │
+│    ▼                       ▼                       ▼                   │
+│ ┌──────────┐      ┌──────────────┐      ┌──────────────────┐          │
+│ │   LLM    │      │   Embedder   │      │  Vector Store    │          │
+│ │ (llms/)  │      │ (embeddings/ │      │ (vector_stores/) │          │
+│ │          │      │              │      │                  │          │
+│ │ Extracts │      │ Text → Vector│      │ Stores & searches│          │
+│ │ facts,   │      │ embeddings   │      │ vectors +        │          │
+│ │ makes    │      │              │      │ metadata         │          │
+│ │ A.U.D.N. │      │              │      │                  │          │
+│ │ decisions│      │              │      │                  │          │
+│ └──────────┘      └──────────────┘      └──────────────────┘          │
+│                                                 ▲                      │
+│                                                 │                      │
+│                          ┌──────────────────────┘                      │
+│                          │                                              │
+│                   ┌──────────────┐     ┌──────────────┐                │
+│                   │ Graph Store  │     │   Reranker   │                │
+│                   │  (optional)  │     │  (optional)  │                │
+│                   │              │     │              │                │
+│                   │ Entity-      │     │ Re-orders    │                │
+│                   │ relationship │     │ search       │                │
+│                   │ knowledge    │     │ results for  │                │
+│                   │ graph        │     │ relevance    │                │
+│                   └──────────────┘     └──────────────┘                │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Provider Pattern
+
+Every pluggable component (LLM, Embedder, Vector Store, Graph Store, Reranker) follows the same pattern:
+
+1. **Base class** (`mem0/<component>/base.py`) defines the interface
+2. **Provider implementations** (`mem0/<component>/<provider>.py`) implement the interface
+3. **Config** (`mem0/configs/<component>/`) defines provider-specific config schemas
+4. **Factory** (`mem0/utils/factory.py`) instantiates the right provider from config
+
+```python
+# Config drives everything — no code changes needed to swap providers
+config = {
+    "vector_store": {"provider": "qdrant", "config": {...}},
+    "llm": {"provider": "ollama", "config": {...}},
+    "embedder": {"provider": "openai", "config": {...}},
+    # ... swap any provider by changing the "provider" string
+}
+memory = Memory.from_config(config)
+```
+
+#### `add()` Flow — Two-Phase Pipeline
+
+The `add()` method (line 648 in `main.py`) runs a two-phase pipeline:
+
+```
+Phase 1: EXTRACTION                          Phase 2: A.U.D.N. CYCLE
+                                            (per memory candidate)
+
+┌──────────────────────┐                    ┌──────────────────────────┐
+│ Input: messages       │                    │ For each candidate:       │
+│ (user + assistant)    │                    │                          │
+│                       │                    │  ┌─────────────────────┐ │
+│ ┌───────────────────┐ │                    │  │ 1. EMBED            │ │
+│ │ Context sources:  │ │                    │  │ embedder.embed(     │ │
+│ │ • Latest exchange │ │                    │  │   candidate)        │ │
+│ │ • Rolling summary │ │                    │  │ → query_vector      │ │
+│ │ • Last N messages │ │                    │  └─────────┬───────────┘ │
+│ └───────────────────┘ │                    │            │             │
+│           │           │                    │            ▼             │
+│           ▼           │                    │  ┌─────────────────────┐ │
+│ ┌───────────────────┐ │                    │  │ 2. SEARCH           │ │
+│ │ LLM.generate_     │ │                    │  │ vector_store.search(│ │
+│ │   response()      │ │                    │  │   query_vector,     │ │
+│ │                   │ │   ┌──────────────┐ │  │   filters)          │ │
+│ │ Prompt:           │ │   │ Memory      │ │  │ → similar_memories  │ │
+│ │ MEMORY_DEDUCTION_ │──┼──▶│ Candidates  │─┼──│ (top-k)             │ │
+│ │ PROMPT            │ │   │ (list of    │ │  └─────────┬───────────┘ │
+│ │                   │ │   │  facts)     │ │            │             │
+│ Output: JSON list   │ │   └──────────────┘ │            ▼             │
+│ of "memory          │ │                    │  ┌─────────────────────┐ │
+│ │ candidates"       │ │                    │  │ 3. A.U.D.N. DECISION│ │
+│ └───────────────────┘ │                    │  │ LLM.generate_       │ │
+│                       │                    │  │   response()        │ │
+└──────────────────────┘                    │  │                     │ │
+                                            │  │ Prompt:             │ │
+                                            │  │ UPDATE_MEMORY_PROMPT│ │
+                                            │  │                     │ │
+                                            │  │ Input: candidate +  │ │
+                                            │  │ similar_memories    │ │
+                                            │  │                     │ │
+                                            │  │ Decision: ADD /     │ │
+                                            │  │ UPDATE / DELETE /   │ │
+                                            │  │ NOOP                │ │
+                                            │  └─────────┬───────────┘ │
+                                            │            │             │
+                                            │            ▼             │
+                                            │  ┌─────────────────────┐ │
+                                            │  │ 4. EXECUTE          │ │
+                                            │  │ vector_store.insert/│ │
+                                            │  │   update/delete     │ │
+                                            │  │ + history_db.log()  │ │
+                                            │  └─────────────────────┘ │
+                                            │                          │
+                                            │  (Optional: graph_store  │
+                                            │   .add entities+edges)   │
+                                            │                          │
+                                            └──────────────────────────┘
+```
+
+Source code references (SHA `8d6b7c1d`):
+- `self.llm.generate_response()` at L833 — Phase 1 extraction
+- `self.embedding_model.embed()` — vector creation
+- `self.vector_store.search()` at L803 — Phase 2 semantic search for similar memories
+- `UPDATE_MEMORY_PROMPT` in `mem0/configs/prompts.py` — A.U.D.N. decision prompt
+
+#### `search()` Flow
+
+The `search()` method (line 1238 in `main.py`) runs a simpler pipeline:
+
+```
+┌────────────────────────────────────────────────────┐
+│  search(query, user_id, agent_id, ...)             │
+│                                                    │
+│  1. BUILD FILTERS                                  │
+│     filters = {user_id, agent_id, run_id}          │
+│                                                    │
+│  2. EMBED QUERY                                    │
+│     embedder.embed(query) → query_vector           │
+│                                                    │
+│  3. VECTOR SEARCH                                  │
+│     vector_store.search(                           │
+│       query_vector,                                │
+│       filters,                                     │
+│       top_k                                        │
+│     ) → raw_results                                │
+│                                                    │
+│  4. RERANK (optional)                              │
+│     reranker.rerank(query, raw_results)             │
+│     → reranked_results                             │
+│                                                    │
+│  5. GRAPH SEARCH (optional, Mem0g)                 │
+│     graph_store.search(query, filters)             │
+│     → related_entities                             │
+│                                                    │
+│  6. FORMAT & RETURN                                │
+│     [{memory, score, metadata, ...}, ...]          │
+└────────────────────────────────────────────────────┘
+```
+
+#### Why the LLM is central
+
+mem0's key innovation is using the LLM not just for text generation, but as a **decision engine** for database operations. The A.U.D.N. cycle delegates Add/Update/Delete/Noop decisions to the LLM, which understands semantic nuance that would be extremely hard to program with if/else rules. For example, "Actually, I don't like cheese anymore" is understood as a DELETE/UPDATE of the existing "likes cheese" memory, not a new fact.
+
+Source: [VirtusLab analysis](https://virtuslab.com/blog/ai/git-hub-all-stars-2/) and [arxiv paper](https://arxiv.org/html/2504.19413v1) ("Mem0: Building Production-Ready AI Agents with Scalable Long-Term Memory").
+
 ---
 
 ## 2. Deployment Modes

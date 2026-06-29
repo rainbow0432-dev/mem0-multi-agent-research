@@ -19,6 +19,200 @@ mem0 是面向 LLM 应用的记忆层。它使用 LLM 从对话中提取"事实"
 
 这不是简单的追加——mem0 会智能管理记忆状态。如果用户说"我现在更喜欢 Python 而不是 Java"，mem0 会更新已有的"偏好 Java"记忆，而不是创建一个矛盾的重复项。
 
+### 内部组件架构
+
+mem0 是一个模块化系统，由中央编排器（`Memory` 类）和可插拔的组件 provider 组成。所有组件使用 **Provider 模式**——通过 JSON 配置，无需修改代码即可替换。
+
+#### 组件一览
+
+| 组件 | 源码目录 | 角色 | Provider 示例 |
+|---|---|---|---|
+| **Memory**（编排器） | `mem0/memory/main.py` | 中央枢纽——编排整个 add/search/update/delete 流程 | N/A（单一类） |
+| **LLM** | `mem0/llms/` | 从对话中提取事实；做出 A.U.D.N. 决策（添加/更新/删除/无操作） | OpenAI、Anthropic、Ollama、Azure、Gemini、Groq、DeepSeek、vLLM、LM Studio（18+） |
+| **Embedder** | `mem0/embeddings/` | 将文本转换为向量嵌入，用于语义搜索 | OpenAI、HuggingFace、Ollama、Azure、Gemini、FastEmbed、Together（13+） |
+| **Vector Store** | `mem0/vector_stores/` | 存储和检索带元数据过滤器的向量嵌入 | Qdrant、pgvector、Milvus、Weaviate、Redis、Chroma、Pinecone、OpenSearch、MongoDB（23+） |
+| **Graph Store**（可选） | `mem0/graphs/` | 将实体关系建模为知识图谱（Mem0g 变体） | Neo4j、Memgraph |
+| **Reranker**（可选） | `mem0/reranker/` | 对搜索结果重新排序以提高相关性 | Cohere、HuggingFace、SentenceTransformer、LLM、ZeroEntropy |
+| **History DB** | `mem0/memory/storage.py` | SQLite——追踪每次添加/更新/删除，用于审计 | SQLite（内置） |
+| **Config** | `mem0/configs/base.py` | 定义所有组件的配置模式 | N/A |
+| **Utils** | `mem0/utils/factory.py` | 工厂模式——根据配置实例化正确的 provider | N/A |
+| **Client** | `mem0/client/main.py` | Platform API 客户端（用于 mem0 Cloud） | N/A |
+| **Proxy** | `mem0/proxy/main.py` | OpenAI 兼容代理，自动处理记忆 | N/A |
+
+#### 架构图
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         mem0 内部架构                                    │
+│                                                                         │
+│                    ┌─────────────────┐                                  │
+│                    │  Memory 类     │  ← 中央编排器                      │
+│                    │  (main.py)     │    入口: add(), search()          │
+│                    └───────┬─────────┘                                  │
+│                            │                                           │
+│              ┌─────────────┼─────────────┐                              │
+│              │             │             │                              │
+│              ▼             ▼             ▼                              │
+│     ┌────────────┐ ┌────────────┐ ┌────────────┐                       │
+│     │   Config   │ │   Utils    │ │ History DB │                       │
+│     │ (base.py)  │ │ (factory)  │ │ (SQLite)   │                       │
+│     │            │ │            │ │ 审计追踪   │                       │
+│     └────────────┘ └────────────┘ └────────────┘                       │
+│                            │                                           │
+│    ┌───────────────────────┼───────────────────────┐                   │
+│    │                       │                       │                   │
+│    ▼                       ▼                       ▼                   │
+│ ┌──────────┐      ┌──────────────┐      ┌──────────────────┐          │
+│ │   LLM    │      │   Embedder   │      │  Vector Store    │          │
+│ │ (llms/)  │      │ (embeddings/ │      │ (vector_stores/) │          │
+│ │          │      │              │      │                  │          │
+│ │ 提取     │      │ 文本 → 向量  │      │ 存储和搜索        │          │
+│ │ 事实,    │      │ 嵌入         │      │ 向量 +            │          │
+│ │ 做出     │      │              │      │ 元数据            │          │
+│ │ A.U.D.N.│      │              │      │                  │          │
+│ │ 决策     │      │              │      │                  │          │
+│ └──────────┘      └──────────────┘      └──────────────────┘          │
+│                                                 ▲                      │
+│                                                 │                      │
+│                          ┌──────────────────────┘                      │
+│                          │                                              │
+│                   ┌──────────────┐     ┌──────────────┐                │
+│                   │ Graph Store  │     │   Reranker   │                │
+│                   │  (可选)      │     │  (可选)      │                │
+│                   │              │     │              │                │
+│                   │ 实体-        │     │ 对搜索       │                │
+│                   │ 关系         │     │ 结果重新     │                │
+│                   │ 知识图谱     │     │ 排序         │                │
+│                   └──────────────┘     └──────────────┘                │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Provider 模式
+
+每个可插拔组件（LLM、Embedder、Vector Store、Graph Store、Reranker）都遵循相同的模式：
+
+1. **基类**（`mem0/<component>/base.py`）定义接口
+2. **Provider 实现**（`mem0/<component>/<provider>.py`）实现接口
+3. **配置**（`mem0/configs/<component>/`）定义 provider 特定的配置模式
+4. **工厂**（`mem0/utils/factory.py`）根据配置实例化正确的 provider
+
+```python
+# 配置驱动一切——更换 provider 只需改字符串，无需改代码
+config = {
+    "vector_store": {"provider": "qdrant", "config": {...}},
+    "llm": {"provider": "ollama", "config": {...}},
+    "embedder": {"provider": "openai", "config": {...}},
+    # ... 更换任何 provider 只需修改 "provider" 字符串
+}
+memory = Memory.from_config(config)
+```
+
+#### `add()` 流程——两阶段管线
+
+`add()` 方法（`main.py` 第 648 行）运行一个两阶段管线：
+
+```
+阶段 1: 提取                                阶段 2: A.U.D.N. 循环
+                                            （每个记忆候选）
+
+┌──────────────────────┐                    ┌──────────────────────────┐
+│ 输入: messages        │                    │ 对每个候选:               │
+│ (user + assistant)    │                    │                          │
+│                       │                    │  ┌─────────────────────┐ │
+│ ┌───────────────────┐ │                    │  │ 1. 嵌入             │ │
+│ │ 上下文来源:        │ │                    │  │ embedder.embed(     │ │
+│ │ • 最新对话         │ │                    │  │   candidate)        │ │
+│ │ • 滚动摘要         │ │                    │  │ → query_vector      │ │
+│ │ • 最近 N 条消息    │ │                    │  └─────────┬───────────┘ │
+│ └───────────────────┘ │                    │            │             │
+│           │           │                    │            ▼             │
+│           ▼           │                    │  ┌─────────────────────┐ │
+│ ┌───────────────────┐ │                    │  │ 2. 搜索             │ │
+│ │ LLM.generate_     │ │                    │  │ vector_store.search(│ │
+│ │   response()      │ │                    │  │   query_vector,     │ │
+│ │                   │ │   ┌──────────────┐ │  │   filters)          │ │
+│ │ 提示词:            │ │   │ 记忆候选     │ │  │ → similar_memories  │ │
+│ │ MEMORY_DEDUCTION_ │──┼──▶│ (事实列表)   │─┼──│ (top-k)             │ │
+│ │ PROMPT            │ │   │              │ │  └─────────┬───────────┘ │
+│ │                   │ │   └──────────────┘ │            │             │
+│ │ 输出: JSON 列表    │ │                    │            ▼             │
+│ │ "记忆候选"         │ │                    │  ┌─────────────────────┐ │
+│ └───────────────────┘ │                    │  │ 3. A.U.D.N. 决策    │ │
+│                       │                    │  │ LLM.generate_       │ │
+└──────────────────────┘                    │  │   response()        │ │
+                                            │  │                     │ │
+                                            │  │ 提示词:             │ │
+                                            │  │ UPDATE_MEMORY_PROMPT│ │
+                                            │  │                     │ │
+                                            │  │ 输入: candidate +   │ │
+                                            │  │ similar_memories    │ │
+                                            │  │                     │ │
+                                            │  │ 决策: ADD /         │ │
+                                            │  │ UPDATE / DELETE /   │ │
+                                            │  │ NOOP                │ │
+                                            │  └─────────┬───────────┘ │
+                                            │            │             │
+                                            │            ▼             │
+                                            │  ┌─────────────────────┐ │
+                                            │  │ 4. 执行             │ │
+                                            │  │ vector_store.insert/│ │
+                                            │  │   update/delete     │ │
+                                            │  │ + history_db.log()  │ │
+                                            │  └─────────────────────┘ │
+                                            │                          │
+                                            │  (可选: graph_store     │ │
+                                            │   .add 实体+边)          │ │
+                                            │                          │
+                                            └──────────────────────────┘
+```
+
+源码引用（SHA `8d6b7c1d`）：
+- `self.llm.generate_response()` 在 L833——阶段 1 提取
+- `self.embedding_model.embed()`——向量创建
+- `self.vector_store.search()` 在 L803——阶段 2 语义搜索查找相似记忆
+- `UPDATE_MEMORY_PROMPT` 在 `mem0/configs/prompts.py`——A.U.D.N. 决策提示词
+
+#### `search()` 流程
+
+`search()` 方法（`main.py` 第 1238 行）运行一个更简单的管线：
+
+```
+┌────────────────────────────────────────────────────┐
+│  search(query, user_id, agent_id, ...)             │
+│                                                    │
+│  1. 构建过滤器                                      │
+│     filters = {user_id, agent_id, run_id}          │
+│                                                    │
+│  2. 嵌入查询                                        │
+│     embedder.embed(query) → query_vector           │
+│                                                    │
+│  3. 向量搜索                                        │
+│     vector_store.search(                           │
+│       query_vector,                                │
+│       filters,                                     │
+│       top_k                                        │
+│     ) → raw_results                                │
+│                                                    │
+│  4. 重排（可选）                                    │
+│     reranker.rerank(query, raw_results)             │
+│     → reranked_results                             │
+│                                                    │
+│  5. 图搜索（可选, Mem0g）                           │
+│     graph_store.search(query, filters)             │
+│     → related_entities                             │
+│                                                    │
+│  6. 格式化并返回                                    │
+│     [{memory, score, metadata, ...}, ...]          │
+└────────────────────────────────────────────────────┘
+```
+
+#### 为什么 LLM 是核心
+
+mem0 的关键创新是将 LLM 不仅用于文本生成，还用作数据库操作的**决策引擎**。A.U.D.N. 循环将添加/更新/删除/无操作决策委托给 LLM，它理解用 if/else 规则极难编程的语义细微差别。例如，"其实我不喜欢奶酪了"被理解为对已有"喜欢奶酪"记忆的 DELETE/UPDATE，而不是一个新事实。
+
+来源：[VirtusLab 分析](https://virtuslab.com/blog/ai/git-hub-all-stars-2/) 和 [arxiv 论文](https://arxiv.org/html/2504.19413v1)（"Mem0: Building Production-Ready AI Agents with Scalable Long-Term Memory"）。
+
 ---
 
 ## 2. 部署模式
